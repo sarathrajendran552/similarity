@@ -1,0 +1,5 @@
+# matchall.py uses only the Python standard library.
+# No third-party packages are required.
+#
+# Tested with Python 3.9+ (uses only stdlib: argparse, base64, csv, hashlib,
+# heapq, json, os, signal, subprocess, sys, time, pathlib).
