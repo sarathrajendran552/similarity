@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import getpass
 import mariadb
 
 OUTPUT_CSV = "template_report.csv"
@@ -39,7 +40,7 @@ def parse_args():
     parser.add_argument("--host", required=True, help="Database hostname")
     parser.add_argument("--port", type=int, default=3306, help="Database port")
     parser.add_argument("--user", required=True, help="Database username")
-    parser.add_argument("--password", required=True, help="Database password")
+    parser.add_argument("--password", help="Database password (will prompt if omitted)")
     parser.add_argument("--database", required=True, help="Database name")
     parser.add_argument(
         "--output",
@@ -53,11 +54,15 @@ def parse_args():
 def main():
     args = parse_args()
 
+    password = args.password
+    if not password:
+        password = getpass.getpass(prompt="Database password: ")
+
     conn = mariadb.connect(
         host=args.host,
         port=args.port,
         user=args.user,
-        password=args.password,
+        password=password,
         database=args.database,
     )
 

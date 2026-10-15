@@ -8,3 +8,4 @@ matchall_query_summary.json
 matchall_errors.log
 __pycache__/
 .venv/
+biooutput
