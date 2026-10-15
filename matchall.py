@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-matchall.py - compare every employee in a template CSV against every other
-employee by repeatedly invoking the `matchbiotmp` binary:
+matchall.py - compare employees in a template CSV by driving the `matchbiotmp`
+binary. It either compares every employee against every other employee, or
+searches a small "query" CSV against a larger database CSV. The binary runs as
+a single long-lived ``--serve`` process so the matching engine is initialised
+once and reused for every comparison.
 
-    matchbiotmp [options] <T1> <T2>
-
-A compulsory --min-score is required: only pairs whose best score is *greater
-than* that value are written to the results file. Every other comparison is
-still performed and counted, but is not recorded individually.
+A compulsory --min-score is required: every template pair whose score is
+*greater than or equal to* that value is written to the results file. Pairs
+below it are still compared but not recorded individually. All matching
+template pairs are recorded (not just the single best per employee pair or per
+query).
 
 The job is fully deterministic and *resumable*. Progress, results and a
 "signature" of the exact command are written to the current working directory.
@@ -28,6 +31,7 @@ import hashlib
 import heapq
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -35,8 +39,15 @@ import time
 from pathlib import Path
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_RESULT_HEADER = ["idx", "emp_a", "emp_b", "n_templates_a", "n_templates_b",
-                  "best_score"]
+# bump this whenever the results-file schema or comparison semantics change, so
+# stale resume state from an older version is rejected instead of silently
+# resumed (which would skip work and truncate the results file)
+_FORMAT_VERSION = 2
+# one row per matching template pair (tpl_a/tpl_b are 1-based within employee)
+_RESULT_HEADER = ["idx", "emp_a", "tpl_a", "emp_b", "tpl_b", "score"]
+# query/search mode: one row per matching (query template, database template)
+_QUERY_RESULT_HEADER = ["idx", "query_emp", "query_tpl", "db_emp", "db_tpl",
+                        "score"]
 
 _STOP = False
 
@@ -284,40 +295,89 @@ def iter_work(n, include_self, self_units, start):
 # --------------------------------------------------------------------------- #
 # matching                                                                    #
 # --------------------------------------------------------------------------- #
-def run_match(binary, t1, t2, threshold, width, height, timeout):
-    """Return (score, error). score is None on failure."""
-    cmd = [binary, "-t", str(threshold), "--width", str(width),
-           "--height", str(height), "b64:" + t1, "b64:" + t2]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, "timeout"
-    except OSError as exc:
-        return None, f"spawn failed: {exc}"
+def _server_error(err: str) -> bool:
+    """True when ``err`` means the persistent server must be restarted."""
+    return err == "timeout" or err.startswith("server")
 
-    score = None
-    for line in proc.stdout.splitlines():
+
+class Matcher:
+    """A single long-lived ``matchbiotmp --serve`` process.
+
+    The engine (and the embedded SDK libraries) is initialised exactly once
+    when the process starts; every subsequent comparison is a line written to
+    stdin and a single reply line read from stdout. This removes the
+    per-pair process spawn / library extraction that dominated the old
+    one-shot invocation, while keeping all orchestration in Python.
+    """
+
+    def __init__(self, binary, threshold, width, height, timeout):
+        self._cmd = [binary, "--serve", "-t", str(threshold),
+                     "--width", str(width), "--height", str(height)]
+        self.timeout = timeout
+        self.proc = None
+        self._spawn()
+
+    def _spawn(self):
+        self.proc = subprocess.Popen(
+            self._cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1)
+
+    def restart(self, log_error):
+        self.close()
+        self._spawn()
+        log_error("restarted matcher process")
+
+    def score(self, t1, t2):
+        """Return (score, error). score is None on failure."""
+        try:
+            self.proc.stdin.write(f"b64:{t1} b64:{t2}\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            return None, f"server write failed: {exc}"
+        ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout)
+        if not ready:
+            return None, "timeout"
+        line = self.proc.stdout.readline()
+        if not line:
+            return None, "server closed unexpectedly"
         line = line.strip()
-        if line.startswith("Score:"):
+        if line.startswith("S "):
             try:
-                score = int(line.split(":", 1)[1])
+                return int(line[2:]), None
             except ValueError:
-                pass
-    if score is None:
-        err = (proc.stderr.strip() or proc.stdout.strip() or
-               f"exit {proc.returncode}").splitlines()
-        return None, (err[-1][:200] if err else "no score produced")
-    return score, None
+                return None, f"bad score line: {line[:80]}"
+        if line.startswith("E "):
+            return None, line[2:][:200]
+        return None, f"unexpected reply: {line[:80]}"
+
+    def close(self):
+        if not self.proc:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.write("Q\n")
+                self.proc.stdin.flush()
+                self.proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        finally:
+            self.proc = None
 
 
-def compare_group(binary, ta, tb, same_emp, threshold, width, height,
-                  timeout, log_error):
+def compare_group(matcher, ta, tb, same_emp, min_score, log_error):
     """Compare every template of ``ta`` against every template of ``tb``.
 
-    Returns (best_score, combos, errors, aborted).
+    Returns (best_score, rows, combos, errors, aborted), where ``rows`` holds
+    ``(tpl_a, tpl_b, score)`` (1-based template indices) for every combination
+    with ``score >= min_score``.
     """
     best = -1
+    rows = []
     combos = 0
     errors = 0
     for ia, x in enumerate(ta):
@@ -325,19 +385,58 @@ def compare_group(binary, ta, tb, same_emp, threshold, width, height,
             if same_emp and ia == ib:
                 continue
             if stop_requested():
-                return best, combos, errors, True
-            score, err = run_match(binary, x, y, threshold, width, height,
-                                   timeout)
+                return best, rows, combos, errors, True
+            score, err = matcher.score(x, y)
             combos += 1
             if err is not None:
                 errors += 1
                 log_error(f"comparison error: {err}")
+                if _server_error(err):
+                    matcher.restart(log_error)
                 continue
             if score > best:
                 best = score
+            if score >= min_score:
+                rows.append((ia + 1, ib + 1, score))
     if best < 0:
         best = 0
-    return best, combos, errors, False
+    return best, rows, combos, errors, False
+
+
+def search_group(matcher, query_templates, db_entries, min_score, log_error):
+    """Score every query template against every database template.
+
+    ``db_entries`` is a list of ``(emp_code, db_tpl, template)`` where
+    ``db_tpl`` is the 1-based template index within that employee. Returns
+    (best_score, best_emp, rows, combos, errors, aborted), where ``rows`` holds
+    ``(query_tpl, db_emp, db_tpl, score)`` for every combination with
+    ``score >= min_score``.
+    """
+    best = -1
+    best_emp = ""
+    rows = []
+    combos = 0
+    errors = 0
+    for qi, x in enumerate(query_templates):
+        for emp, db_tpl, y in db_entries:
+            if stop_requested():
+                return best, best_emp, rows, combos, errors, True
+            score, err = matcher.score(x, y)
+            combos += 1
+            if err is not None:
+                errors += 1
+                log_error(f"comparison error: {err}")
+                if _server_error(err):
+                    matcher.restart(log_error)
+                continue
+            if score > best:
+                best = score
+                best_emp = emp
+            if score >= min_score:
+                rows.append((qi + 1, emp, db_tpl, score))
+    if best < 0:
+        best = 0
+    return best, best_emp, rows, combos, errors, False
 
 
 # --------------------------------------------------------------------------- #
@@ -349,8 +448,9 @@ def file_fingerprint(path: Path):
             "mtime_ns": st.st_mtime_ns}
 
 
-def make_signature(args, binary, n_emps, total):
+def make_signature(args, binary, n_emps, total, query_path=None):
     data = {
+        "format_version": _FORMAT_VERSION,
         "csv": file_fingerprint(Path(args.csv)),
         "binary": file_fingerprint(Path(binary)),
         "threshold": args.threshold,
@@ -362,7 +462,10 @@ def make_signature(args, binary, n_emps, total):
         "limit_emps": args.limit_emps,
         "n_emps": n_emps,
         "total": total,
+        "mode": "query" if query_path is not None else "all",
     }
+    if query_path is not None:
+        data["query_csv"] = file_fingerprint(query_path)
     blob = json.dumps(data, sort_keys=True).encode()
     return hashlib.sha256(blob).hexdigest(), data
 
@@ -384,24 +487,26 @@ def write_state(path: Path, signature, sig_data, total, completed,
     os.replace(tmp, path)
 
 
-def sanitize_results(results_path: Path, completed: int):
+def sanitize_results(results_path: Path, completed: int,
+                     header=None):
     """Tidy the results file and create it with a header if missing.
 
-    Only pairs above the minimum score are recorded, so the number of data
+    Only rows above the minimum score are recorded, so the number of data
     lines no longer equals the number of completed work units. ``completed``
     (kept in the state file) is the source of truth for resume; here we drop
     any partial trailing line and any row belonging to an uncommitted unit
     (``idx >= completed``) so a hard kill can never duplicate or lose a match.
     """
+    header = header or _RESULT_HEADER
     if not results_path.exists():
         with open(results_path, "w", newline="") as f:
-            csv.writer(f, lineterminator="\n").writerow(_RESULT_HEADER)
+            csv.writer(f, lineterminator="\n").writerow(header)
         return
     with open(results_path, "r", newline="") as f:
         rows = list(csv.reader(f))
-    clean = [_RESULT_HEADER]
+    clean = [header]
     for row in rows[1:]:
-        if len(row) != len(_RESULT_HEADER):
+        if len(row) != len(header):
             break                                   # partial trailing line
         try:
             idx = int(row[0])
@@ -424,14 +529,16 @@ def backup(path: Path):
 # --------------------------------------------------------------------------- #
 # summary                                                                     #
 # --------------------------------------------------------------------------- #
-def collect_summary(results_path: Path, pairs_compared, min_score, top_n,
+def collect_summary(results_path: Path, units_compared, min_score, top_n,
                     best_pair):
-    """Build the summary from the (already filtered) results file.
+    """Build the all-vs-all summary from the results file.
 
-    Every data line in ``results_path`` is a recorded match (score above
-    ``min_score``); everything else is only counted via ``pairs_compared``.
+    Every data line is a matching template pair (score >= ``min_score``); the
+    number of work units (employee pairs) with at least one match is counted
+    from the distinct ``idx`` values.
     """
     matches = 0
+    matched_units = set()
     top: list = []
     with open(results_path, newline="") as f:
         reader = csv.reader(f)
@@ -440,43 +547,102 @@ def collect_summary(results_path: Path, pairs_compared, min_score, top_n,
             if len(row) < 6:
                 continue
             matches += 1
+            matched_units.add(row[0])
             score = int(row[5])
             if top_n > 0:
-                heapq.heappush(top, (score, row[1], row[2]))
+                heapq.heappush(top, (score, row[1], row[2], row[3], row[4]))
                 if len(top) > top_n:
                     heapq.heappop(top)
 
     top_sorted = sorted(top, reverse=True)
-    non_matches = pairs_compared - matches
     return {
-        "pairs_compared": pairs_compared,
+        "units_compared": units_compared,
         "min_score": min_score,
-        "matches": matches,
-        "non_matches": non_matches,
-        "match_rate_pct": round(100.0 * matches / pairs_compared, 4)
-        if pairs_compared else 0.0,
+        "template_pairs_matched": matches,
+        "units_matched": len(matched_units),
         "best": {"score": best_pair[0], "emp_a": best_pair[1],
                  "emp_b": best_pair[2]}
-        if pairs_compared and best_pair[0] >= 0 else None,
-        "top": [{"score": s, "emp_a": a, "emp_b": b}
-                for s, a, b in top_sorted],
+        if units_compared and best_pair[0] >= 0 else None,
+        "top": [{"score": s, "emp_a": a, "tpl_a": ta, "emp_b": b, "tpl_b": tb}
+                for s, a, ta, b, tb in top_sorted],
     }
 
 
 def print_summary(summary, summary_path: Path):
-    total = summary["pairs_compared"]
+    total = summary["units_compared"]
     print()
-    print(f"Pairs compared : {total}")
-    print(f"Matches (> {summary['min_score']}) : {summary['matches']}"
-          + (f" ({summary['match_rate_pct']}%)" if total else ""))
-    print(f"Filtered out   : {summary['non_matches']}")
+    print(f"Units compared : {total}")
+    print(f"Template pairs (>= {summary['min_score']}) : "
+          f"{summary['template_pairs_matched']}")
+    print(f"Units matched  : {summary['units_matched']}")
     if summary["best"]:
         b = summary["best"]
         print(f"Best score     : {b['score']}  ({b['emp_a']} vs {b['emp_b']})")
     if summary["top"]:
-        print(f"Top {len(summary['top'])}:")
+        print(f"Top {len(summary['top'])} template pairs:")
         for item in summary["top"]:
-            print(f"  {item['score']:>3}  {item['emp_a']} vs {item['emp_b']}")
+            print(f"  {item['score']:>3}  "
+                  f"{item['emp_a']}[{item['tpl_a']}] vs "
+                  f"{item['emp_b']}[{item['tpl_b']}]")
+    print(f"Summary written to {summary_path.name}")
+
+
+def collect_query_summary(results_path: Path, queries_compared, min_score,
+                          top_n, best_pair):
+    """Build the summary for a query/search run.
+
+    Every data line is a matching (query template, database template) pair
+    scoring >= ``min_score``.
+    """
+    matches = 0
+    matched_queries = set()
+    top: list = []
+    with open(results_path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 6:
+                continue
+            matches += 1
+            matched_queries.add(row[0])
+            score = int(row[5])
+            if top_n > 0:
+                heapq.heappush(top, (score, row[1], row[2], row[3], row[4]))
+                if len(top) > top_n:
+                    heapq.heappop(top)
+
+    top_sorted = sorted(top, reverse=True)
+    return {
+        "mode": "query",
+        "queries": queries_compared,
+        "min_score": min_score,
+        "template_pairs_matched": matches,
+        "queries_matched": len(matched_queries),
+        "unmatched": queries_compared - len(matched_queries),
+        "best": {"score": best_pair[0], "emp_a": best_pair[1],
+                 "emp_b": best_pair[2]}
+        if queries_compared and best_pair[0] >= 0 else None,
+        "top": [{"score": s, "emp_a": a, "tpl_a": ta, "emp_b": b, "tpl_b": tb}
+                for s, a, ta, b, tb in top_sorted],
+    }
+
+
+def print_query_summary(summary, summary_path: Path):
+    print()
+    print(f"Queries        : {summary['queries']}")
+    print(f"Template pairs (>= {summary['min_score']}) : "
+          f"{summary['template_pairs_matched']}")
+    print(f"Queries matched: {summary['queries_matched']}")
+    print(f"No match       : {summary['unmatched']}")
+    if summary["best"]:
+        b = summary["best"]
+        print(f"Best score     : {b['score']}  ({b['emp_a']} -> {b['emp_b']})")
+    if summary["top"]:
+        print(f"Top {len(summary['top'])} template pairs:")
+        for item in summary["top"]:
+            print(f"  {item['score']:>3}  "
+                  f"{item['emp_a']}[{item['tpl_a']}] -> "
+                  f"{item['emp_b']}[{item['tpl_b']}]")
     print(f"Summary written to {summary_path.name}")
 
 
@@ -486,16 +652,20 @@ def print_summary(summary, summary_path: Path):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="matchall.py",
-        description="Run matchbiotmp for every pair of employees in a "
-                    "template CSV (resumable).",
+        description="Compare employees in a template CSV with matchbiotmp: "
+                    "all-vs-all, or a query CSV against a database CSV "
+                    "(resumable).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--csv", required=True, help="input template CSV")
+    p.add_argument("--csv", required=True,
+                   help="input template CSV (the database)")
+    p.add_argument("--query-csv", default=None,
+                   help="search mode: score every employee in this (small) CSV "
+                        "against --csv and record every matching template pair")
     p.add_argument("--matchbiotmp", default=None,
                    help="path to the matchbiotmp binary")
     p.add_argument("--min-score", type=int, required=True,
-                   help="compulsory: only record pairs whose best score is "
-                        "GREATER than this value (all other comparisons are "
-                        "still run and counted)")
+                   help="compulsory: record every template pair whose score "
+                        "is >= this value (all comparisons are still run)")
     p.add_argument("-t", "--threshold", type=int, default=35,
                    help="match threshold passed to matchbiotmp")
     p.add_argument("--width", type=int, default=256)
@@ -512,15 +682,19 @@ def parse_args(argv=None):
     p.add_argument("--timeout", type=float, default=30.0,
                    help="per-comparison timeout in seconds")
     p.add_argument("--top", type=int, default=10,
-                   help="number of top scoring pairs to report")
+                   help="number of top scoring template pairs to report")
     p.add_argument("--state-file", default="matchall_resume.json",
                    help="resume/state file (in the working directory)")
-    p.add_argument("--results-file", default="matchall_results.csv",
-                   help="per-pair results file")
+    p.add_argument("--results-file", default=None,
+                   help="per-unit results file "
+                        "(default: matchall_query_results.csv in --query-csv "
+                        "mode, else matchall_results.csv)")
     p.add_argument("--errors-file", default="matchall_errors.log",
                    help="log for individual comparison errors")
-    p.add_argument("--summary-file", default="matchall_summary.json",
-                   help="JSON summary written at the end")
+    p.add_argument("--summary-file", default=None,
+                   help="JSON summary written at the end "
+                        "(default: matchall_query_summary.json in --query-csv "
+                        "mode, else matchall_summary.json)")
     p.add_argument("--state-every", type=int, default=1,
                    help="rewrite the state file every N work units")
     p.add_argument("--fresh", action="store_true",
@@ -555,7 +729,18 @@ def main(argv=None):
     csv_path = Path(args.csv)
     if not csv_path.is_file():
         sys.exit(f"error: CSV not found: {csv_path}")
+    query_path = Path(args.query_csv) if args.query_csv else None
+    if query_path is not None and not query_path.is_file():
+        sys.exit(f"error: query CSV not found: {query_path}")
+    query_mode = query_path is not None
     binary = resolve_binary(args.matchbiotmp)
+
+    if args.results_file is None:
+        args.results_file = ("matchall_query_results.csv" if query_mode
+                             else "matchall_results.csv")
+    if args.summary_file is None:
+        args.summary_file = ("matchall_query_summary.json" if query_mode
+                             else "matchall_summary.json")
 
     status = Status(
         ["Loading template database",
@@ -576,18 +761,38 @@ def main(argv=None):
     # ---- step 1: load ----------------------------------------------------- #
     status.step(0)
     groups = load_records(csv_path, args.include_json, warn)
-    emps = sorted(groups.keys())
-    if args.limit_emps > 0:
-        emps = emps[:args.limit_emps]
-    templates = [groups[e] for e in emps]
-    n = len(emps)
+    db_emps = sorted(groups.keys())
+    if args.limit_emps > 0 and not query_mode:
+        db_emps = db_emps[:args.limit_emps]
+    db_templates = [groups[e] for e in db_emps]
+    n = len(db_emps)
+
+    q_emps: list[str] = []
+    q_templates: list[list[str]] = []
+    if query_mode:
+        qgroups = load_records(query_path, args.include_json, warn)
+        q_emps = sorted(qgroups.keys())
+        if args.limit_emps > 0:
+            q_emps = q_emps[:args.limit_emps]
+        q_templates = [qgroups[e] for e in q_emps]
     status.step(1)
 
-    self_units = [i for i in range(n) if len(templates[i]) > 1] \
-        if args.include_self else []
-    total = n * (n - 1) // 2 + len(self_units)
+    # ---- plan ------------------------------------------------------------- #
+    # each db entry is (emp_code, 1-based template index within emp, template)
+    db_entries = [(db_emps[i], ti + 1, t)
+                  for i in range(n)
+                  for ti, t in enumerate(db_templates[i])]
+    self_units = []
+    if query_mode:
+        total = len(q_emps)
+        header = _QUERY_RESULT_HEADER
+    else:
+        self_units = [i for i in range(n) if len(db_templates[i]) > 1] \
+            if args.include_self else []
+        total = n * (n - 1) // 2 + len(self_units)
+        header = _RESULT_HEADER
 
-    signature, sig_data = make_signature(args, binary, n, total)
+    signature, sig_data = make_signature(args, binary, n, total, query_path)
 
     state_path = Path(args.state_file)
     results_path = Path(args.results_file)
@@ -613,9 +818,9 @@ def main(argv=None):
             b = old.get("best") or {}
             best_pair = (int(b.get("score", -1)), b.get("emp_a", ""),
                          b.get("emp_b", ""))
-            sanitize_results(results_path, completed)
+            sanitize_results(results_path, completed, header)
             resumed = completed > 0
-            print(f"Resuming: {completed}/{total} pairs already done "
+            print(f"Resuming: {completed}/{total} already done "
                   f"({100.0 * completed / total:.1f}%).")
         else:
             print("Existing state does not match this command; "
@@ -627,21 +832,34 @@ def main(argv=None):
         for p in (state_path, results_path):
             backup(p)
 
-    if completed == 0 and not results_path.exists():
-        sanitize_results(results_path, 0)    # create with header
+    if completed == 0:
+        sanitize_results(results_path, 0, header)    # create header / drop stale
 
     if not resumed:
-        print(f"Plan: {n} employee(s), {total} pair(s) to compare "
-              f"(min score {args.min_score}, threshold {args.threshold}).")
+        if query_mode:
+            print(f"Plan: {total} query employee(s) searched against "
+                  f"{n} database employee(s) / {len(db_entries)} template(s) "
+                  f"(min score {args.min_score}, "
+                  f"threshold {args.threshold}).")
+        else:
+            print(f"Plan: {n} employee(s), {total} pair(s) to compare "
+                  f"(min score {args.min_score}, "
+                  f"threshold {args.threshold}).")
 
     if args.dry_run:
         status.finish()
-        print(f"Dry run complete. Would compare {total} pairs "
-              f"(recording scores > {args.min_score}); "
-              f"{completed} already done.")
+        if query_mode:
+            print(f"Dry run complete. Would search {total} query employee(s) "
+                  f"against {len(db_entries)} database template(s) "
+                  f"(recording template pairs with score >= {args.min_score}); "
+                  f"{completed} already done.")
+        else:
+            print(f"Dry run complete. Would compare {total} units "
+                  f"(recording template pairs with score >= {args.min_score}); "
+                  f"{completed} already done.")
         return 0
 
-    # ---- step 3: compare -------------------------------------------------- #
+    # ---- step 3: match ---------------------------------------------------- #
     start_time = time.time()
     errors_written = 0
     _STOP = False
@@ -658,31 +876,60 @@ def main(argv=None):
     status.set_progress(completed, total)
     done = completed
 
-    with open(results_path, "a", newline="") as wf:
-        writer = csv.writer(wf, lineterminator="\n")
-        for idx, i, j, is_self in iter_work(n, args.include_self, self_units,
-                                            completed):
-            if stop_requested():
-                break
-            ta, tb = templates[i], templates[j]
-            best, combos, errs, aborted = compare_group(
-                binary, ta, tb, is_self, args.threshold, args.width,
-                args.height, args.timeout, log_error)
-            if aborted:
-                break
-            if best > args.min_score:
-                writer.writerow([idx, emps[i], emps[j], len(ta), len(tb),
-                                 best])
-                wf.flush()
-            done = idx + 1
-            status.set_progress(done, total)
-            if best > best_pair[0]:
-                best_pair = (best, emps[i], emps[j])
-            if args.delay:
-                time.sleep(args.delay)
-            if done % max(1, args.state_every) == 0:
-                write_state(state_path, signature, sig_data, total, done,
-                            results_path.name, best_pair)
+    matcher = Matcher(binary, args.threshold, args.width, args.height,
+                      args.timeout)
+    try:
+        with open(results_path, "a", newline="") as wf:
+            writer = csv.writer(wf, lineterminator="\n")
+            if query_mode:
+                for qi in range(completed, total):
+                    if stop_requested():
+                        break
+                    best, best_emp, rows, _combos, _errs, aborted = \
+                        search_group(matcher, q_templates[qi], db_entries,
+                                     args.min_score, log_error)
+                    if aborted:
+                        break
+                    for qt, db_emp, db_tpl, score in rows:
+                        writer.writerow([qi, q_emps[qi], qt, db_emp, db_tpl,
+                                         score])
+                    if rows:
+                        wf.flush()
+                    done = qi + 1
+                    status.set_progress(done, total)
+                    if best > best_pair[0]:
+                        best_pair = (best, q_emps[qi], best_emp)
+                    if args.delay:
+                        time.sleep(args.delay)
+                    if done % max(1, args.state_every) == 0:
+                        write_state(state_path, signature, sig_data, total,
+                                    done, results_path.name, best_pair)
+            else:
+                for idx, i, j, is_self in iter_work(n, args.include_self,
+                                                    self_units, completed):
+                    if stop_requested():
+                        break
+                    ta, tb = db_templates[i], db_templates[j]
+                    best, rows, _combos, _errs, aborted = compare_group(
+                        matcher, ta, tb, is_self, args.min_score, log_error)
+                    if aborted:
+                        break
+                    for tpl_a, tpl_b, score in rows:
+                        writer.writerow([idx, db_emps[i], tpl_a, db_emps[j],
+                                         tpl_b, score])
+                    if rows:
+                        wf.flush()
+                    done = idx + 1
+                    status.set_progress(done, total)
+                    if best > best_pair[0]:
+                        best_pair = (best, db_emps[i], db_emps[j])
+                    if args.delay:
+                        time.sleep(args.delay)
+                    if done % max(1, args.state_every) == 0:
+                        write_state(state_path, signature, sig_data, total,
+                                    done, results_path.name, best_pair)
+    finally:
+        matcher.close()
 
     # ---- interruption? ---------------------------------------------------- #
     if stop_requested() or done < total:
@@ -700,13 +947,20 @@ def main(argv=None):
                 results_path.name, best_pair)
     status.step(3)
     elapsed = time.time() - start_time
-    summary = collect_summary(results_path, total, args.min_score, args.top,
-                              best_pair)
+    if query_mode:
+        summary = collect_query_summary(results_path, total, args.min_score,
+                                        args.top, best_pair)
+    else:
+        summary = collect_summary(results_path, total, args.min_score,
+                                  args.top, best_pair)
     summary_path.write_text(json.dumps(summary, indent=2))
     status.finish()
-    print_summary(summary, summary_path)
+    if query_mode:
+        print_query_summary(summary, summary_path)
+    else:
+        print_summary(summary, summary_path)
     print(f"Elapsed: {elapsed:.1f}s "
-          f"({elapsed / max(1, done):.2f}s per pair)")
+          f"({elapsed / max(1, done):.2f}s per unit)")
     if errors_written:
         print(f"{errors_written} error(s) logged to {errors_path.name}")
     return 0

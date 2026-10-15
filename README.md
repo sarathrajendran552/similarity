@@ -55,13 +55,13 @@ algorithm, and uses the public `ZKFPM_DBMatch` API to score templates.
 ├── src/
 │   └── matchbiotmp.c        # the whole tool
 ├── matchbiotmp              # built, self-contained x86-64 ELF (~7.7 MB)
-├── matchall.py              # batch all-vs-all driver (resumable)
+├── matchall.py              # batch driver: all-vs-all or query/search (resumable)
 ├── requirements.txt         # Python deps for matchall.py (none)
-├── build/                   # objcopy objects + copied .so files (build artifacts)
+├── build/                   # tracked SDK .so files + objcopy objects
 ├── template_report.csv      # example template database
-└── ZKTecoSDK/               # original ZKTeco SDK distribution
+└── ZKTecoSDK/               # original ZKTeco SDK distribution (not needed to build)
     ├── SDK/
-    │   ├── lib-x64/         # libraries embedded by the build
+    │   ├── lib-x64/
     │   └── lib-x86/
     └── Demo&Doc/
         ├── c/demo/          # reference C demo + headers
@@ -75,8 +75,8 @@ algorithm, and uses the public `ZKFPM_DBMatch` API to score templates.
 `libusb-1.0`; USB is never actually exercised for offline matching). No SDK,
 sensor, or license is required.
 
-**Build** (only when rebuilding): `gcc`, GNU `objcopy`, and the
-`ZKTecoSDK/SDK/lib-x64/` directory.
+**Build** (only when rebuilding): `gcc` and GNU `objcopy`. The SDK shared
+libraries are committed under `build/`, so nothing else is required.
 
 ## Build
 
@@ -85,8 +85,9 @@ sensor, or license is required.
 # -> built: /path/to/matchbiotmp
 ```
 
-`build.sh` copies each required shared library, converts it to an object file
-with `objcopy -I binary`, and links everything into one executable. The result
+`build.sh` takes each required shared library from the tracked `build/`
+directory, converts it to an object file with `objcopy -I binary`, and links
+everything into one executable. It does not use `ZKTecoSDK/` at all. The result
 depends only on the system C/C++ runtime:
 
 ```sh
@@ -104,6 +105,7 @@ $ ldd matchbiotmp
 matchbiotmp [options] <T1> <T2>                 match two templates
 matchbiotmp [options] --csv F --emp A --emp B   match two employees
 matchbiotmp [options] --csv F --all             pairwise score matrix
+matchbiotmp [options] --serve                   score pairs from stdin (daemon)
 ```
 
 Run `./matchbiotmp --help` for the full option list.
@@ -121,6 +123,7 @@ Run `./matchbiotmp --help` for the full option list.
 | `--row N` | 1-based data row; give it twice |
 | `--all` | Score every pair among CSV rows |
 | `--limit N` | Max rows for `--all` (default `10`) |
+| `--serve` | Load the engine once, then score pairs read from stdin (see below) |
 | `-q, --quiet` | Print only the score |
 | `-v, --verbose` | Extra diagnostics (per-pair scores) on stderr |
 | `-h, --help` | Help |
@@ -190,6 +193,24 @@ emp_code,144472,33825,143476,33133,141182
 ...
 ```
 
+### Persistent server mode (`--serve`)
+
+`--serve` initialises the engine **once** and then reads one request per line
+from stdin until EOF (or a line `Q`). A request is two whitespace-separated
+templates in any of the usual forms (`b64:`/`hex:`/`raw:`/file/Base64; Base64
+and hex contain no whitespace). Each reply is a single line — `S <score>` on
+success or `E <message>` on error:
+
+```sh
+printf 'b64:... b64:...\nb64:... b64:...\nQ\n' | ./matchbiotmp --serve
+# S 94
+# S 0
+```
+
+This exists so a driver (e.g. `matchall.py`) can reuse the initialised engine
+for many comparisons instead of paying the process startup, embedded-library
+extraction, license setup, and `dlopen` costs on every single pair.
+
 ### Score semantics
 
 * Scores are integers in the range **0–100** (100 = identical template).
@@ -209,26 +230,47 @@ emp_code,144472,33825,143476,33133,141182
 
 ## Batch comparison — `matchall.py`
 
-`matchall.py` is a resumable driver that compares **every employee against
-every other employee** in a CSV by invoking `matchbiotmp` once per template
-pair. It only uses the Python standard library (see `requirements.txt`).
+`matchall.py` is a resumable driver that compares templates in a CSV. It only
+uses the Python standard library (see `requirements.txt`). It launches a single
+long-lived `matchbiotmp --serve` process (engine initialised once) and streams
+template pairs to it, so no work is wasted re-initialising the SDK per pair.
 
-`--min-score` is **compulsory**: only employee pairs whose best score is
-**greater than** this value are written to the results file. All other
-comparisons are still performed and counted, they are just not recorded
-individually — so the results file stays small and contains only the pairs you
-care about.
+`--min-score` is **compulsory**: **every** template pair whose score is
+**greater than or equal to** this value is written to the results file. Pairs
+below it are still compared but not recorded individually. Matching is at the
+level of individual template pairs — all of them are recorded, not just the
+single best per employee pair or per query.
+
+**All-vs-all (default).** Compares **every employee against every other
+employee** in the CSV. For each unordered pair of distinct `emp_code`s it
+compares **all** template combinations of the two employees and records every
+combination scoring `>= --min-score`. With `--include-self` it additionally
+compares an employee's own templates against each other (useful for
+capture-quality checks).
 
 ```sh
-python3 matchall.py --csv template_report.csv --min-score 50   # only scores >50
+python3 matchall.py --csv template_report.csv --min-score 50   # scores >= 50
 python3 matchall.py --csv template_report.csv --min-score 50 --limit-emps 100
 python3 matchall.py --csv template_report.csv --min-score 0 --include-self
 ```
 
-For each unordered pair of distinct `emp_code`s it compares **all** template
-combinations of the two employees and records the best score. With
-`--include-self` it additionally compares an employee's own templates against
-each other (useful for capture-quality checks).
+### Query / search mode (`--query-csv`)
+
+Add `--query-csv FILE` to search a small CSV against the database given by
+`--csv`. **Every** query template is scored against **every** database template
+(1:N identification) and every pair scoring `>= --min-score` is recorded. The
+database is loaded once and reuses the same persistent engine — so a 5-row query
+against a 7000-row database is ~35 000 comparisons in one process:
+
+```sh
+python3 matchall.py --csv template_report.csv --query-csv new_hires.csv --min-score 50
+```
+
+Results are written to `matchall_query_results.csv` as
+`idx,query_emp,query_tpl,db_emp,db_tpl,score` — one row per matching
+(query template, database template) pair — and to `matchall_query_summary.json`.
+Directing a single template at the database is just the one-row case of this
+mode.
 
 ### Status display
 
@@ -250,13 +292,14 @@ any time) the following files are kept in the current working directory:
 | File | Purpose |
 | --- | --- |
 | `matchall_resume.json` | signature of the exact command + progress |
-| `matchall_results.csv` | matches only: one row per pair scoring above `--min-score` (`idx,emp_a,emp_b,n_templates_a,n_templates_b,best_score`) |
-| `matchall_summary.json` | final statistics (compared, matches, filtered out) and top pairs |
+| `matchall_results.csv` | all-vs-all: one row per matching template pair scoring `>= --min-score` (`idx,emp_a,tpl_a,emp_b,tpl_b,score`; `idx` repeats per employee pair) |
+| `matchall_query_results.csv` | query mode: one row per matching (query template, database template) pair (`idx,query_emp,query_tpl,db_emp,db_tpl,score`) |
+| `matchall_summary.json` / `matchall_query_summary.json` | final statistics and top matching template pairs |
 | `matchall_errors.log` | individual comparison errors |
 
 Run the **same command again** and it detects the matching signature and
-resumes from the first unfinished pair. Completed work is tracked in
-`matchall_resume.json` (written after every pair by default); the results file
+resumes from the first unfinished work unit. Completed work is tracked in
+`matchall_resume.json` (written after every unit by default); the results file
 records each match with its work-unit `idx`, so on restart any partially written
 line or not-yet-committed row is discarded — the run is safe even against a hard
 `SIGKILL`. If you run a **different** command, the old state/results are backed
@@ -286,7 +329,8 @@ All filenames are configurable (`--state-file`, `--results-file`, …). Run
    size — no sensor needed.
 4. **Matching.** `ZKFPM_DBMatch()` scores each template pair. The tool handles
    Base64/hex/raw decoding, CSV parsing, the cross-product logic, thresholding,
-   and formatting.
+   and formatting. In `--serve` mode the engine is initialised once and many
+   pairs are scored in the same process, which is what `matchall.py` uses.
 5. **Noise suppression.** The SDK prints diagnostics (`Algorithm Version:...`)
    to stdout; the tool redirects them to `/dev/null` during initialization
    unless `-v` is given.

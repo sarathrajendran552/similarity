@@ -74,6 +74,7 @@ static const unsigned char kLicense[] = {
 static int   opt_quiet = 0;
 static int   opt_verbose = 0;
 static int   opt_all = 0;
+static int   opt_serve = 0;
 static int   opt_limit = 10;
 static int   opt_threshold = 35;
 static int   opt_width = 256;
@@ -492,6 +493,7 @@ static void usage(FILE *f)
 "  matchbiotmp [options] <T1> <T2>              match two templates\n"
 "  matchbiotmp [options] --csv F --emp A --emp B  match two employees\n"
 "  matchbiotmp [options] --csv F --all            pairwise score matrix\n"
+"  matchbiotmp [options] --serve                  score pairs read from stdin\n"
 "\n"
 "Templates may be: a file (raw / base64 / hex), a literal base64 string,\n"
 "or prefixed with b64: / hex: / raw: .\n"
@@ -499,6 +501,12 @@ static void usage(FILE *f)
 "When --emp (or --row) is given twice, every template enrolled for the first\n"
 "employee is compared against every template of the second; the reported\n"
 "score is the best (highest) of those comparisons.\n"
+"\n"
+"--serve loads the engine once and then reads one request per line from stdin\n"
+"until EOF (or a line 'Q'). A request is two whitespace-separated templates\n"
+"(same forms as T1/T2 above; base64/hex contain no whitespace). Each reply is\n"
+"a single line: 'S <score>' on success or 'E <message>' on error. This lets a\n"
+"driver reuse the initialised engine across many comparisons.\n"
 "\n"
 "Options:\n"
 "  -i, --input-format raw|b64|hex|auto  interpretation of file input (auto)\n"
@@ -529,6 +537,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) opt_verbose = 1;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else if (!strcmp(a, "--all")) opt_all = 1;
+        else if (!strcmp(a, "--serve")) opt_serve = 1;
         else if (!strcmp(a, "-t") || !strcmp(a, "--threshold")) { opt_threshold = atoi(argv[++i]); }
         else if (!strcmp(a, "--width")) opt_width = atoi(argv[++i]);
         else if (!strcmp(a, "--height")) opt_height = atoi(argv[++i]);
@@ -549,6 +558,40 @@ int main(int argc, char **argv)
         unsetenv("MATCHBIOTMP_CLEAN");
         g_clean_dir = libdir;
         atexit(cleanup_extract);
+    }
+
+    /* ----- serve mode: load the engine once, then score pairs ----- */
+    if (opt_serve) {
+        engine_init(libdir);
+        static char line[65536];
+        while (fgets(line, sizeof line, stdin)) {
+            size_t l = strlen(line);
+            while (l && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+                line[--l] = '\0';
+            if (l == 0) continue;
+            if (!strcmp(line, "Q") || !strcmp(line, "QUIT")) break;
+
+            char *sp = line;
+            while (*sp && !isspace((unsigned char)*sp)) sp++;
+            if (!*sp) { printf("E missing second template\n"); fflush(stdout); continue; }
+            *sp = '\0';
+            char *t1 = line;
+            char *t2 = sp + 1;
+            while (*t2 && isspace((unsigned char)*t2)) t2++;
+            if (!*t2) { printf("E missing second template\n"); fflush(stdout); continue; }
+
+            struct tpl a, b;
+            if (parse_template(t1, &a) != 0) {
+                printf("E cannot parse first template\n"); fflush(stdout); continue;
+            }
+            if (parse_template(t2, &b) != 0) {
+                printf("E cannot parse second template\n"); fflush(stdout); continue;
+            }
+            int s = g_match(g_db, a.data, a.len, b.data, b.len);
+            printf("S %d\n", s);
+            fflush(stdout);
+        }
+        return 0;
     }
 
     /* ----- gather templates ----- */

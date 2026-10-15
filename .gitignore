@@ -1,5 +1,9 @@
 ZKTecoSDK/
 template_report.csv
 matchall_results.csv*
+matchall_query_results.csv*
 matchall_resume.json*
 matchall_summary.json
+matchall_query_summary.json
+matchall_errors.log
+__pycache__/
