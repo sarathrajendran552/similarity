@@ -2,5 +2,6 @@
 #   Tested with Python 3.9+ (uses only stdlib: argparse, base64, csv, hashlib,
 #   heapq, json, os, select, signal, subprocess, sys, time, pathlib).
 #
-# querytogettemplates.py additionally needs the MariaDB connector:
+# The MariaDB export scripts (querytogettemplates.py, GetallTemplates.py,
+# GetBiotmpforEmpCode.py, GetempndbioasperTime.py) need the connector:
 mariadb

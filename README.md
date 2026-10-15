@@ -56,7 +56,10 @@ algorithm, and uses the public `ZKFPM_DBMatch` API to score templates.
 │   └── matchbiotmp.c        # the whole tool
 ├── matchbiotmp              # built, self-contained x86-64 ELF (~7.7 MB)
 ├── matchall.py              # batch driver: all-vs-all or query/search (resumable)
-├── requirements.txt         # Python deps for matchall.py (none)
+├── GetallTemplates.py       # export all templates from MariaDB -> CSV
+├── GetBiotmpforEmpCode.py   # export one employee's template(s) from MariaDB
+├── GetempndbioasperTime.py  # export templates by punch-time window from MariaDB
+├── requirements.txt         # Python deps (mariadb; matchall.py needs none)
 ├── build/                   # tracked SDK .so files + objcopy objects
 ├── template_report.csv      # example template database
 └── ZKTecoSDK/               # original ZKTeco SDK distribution (not needed to build)
@@ -308,6 +311,49 @@ up (`*.bak.<timestamp>`) and a fresh run starts; use `--fresh` to force this.
 All filenames are configurable (`--state-file`, `--results-file`, …). Run
 `python3 matchall.py --help` for every option (`--min-score`, `--threshold`,
 `--delay`, `--timeout`, `--state-every`, `--top`, `--dry-run`, …).
+
+---
+
+## Fetching templates from MariaDB
+
+Three helper scripts query a remote attendance/biometric MariaDB (the
+`iclock_biodata` / `iclock_transaction` / `personnel_employee` schema) and export
+templates and employee data for use with `matchbiotmp` / `matchall.py`. They need
+the MariaDB connector (`pip install mariadb`; declared in `requirements.txt` and
+`pyproject.toml`).
+
+All three take the same connection options — `--host`, `--port` (default 3306),
+`--user`, `--database`, and `--password` (if `--password` is omitted you are
+prompted securely via `getpass`, so it never lands in your shell history):
+
+| Script | Arguments | Output |
+| --- | --- | --- |
+| `GetallTemplates.py` | none | `template_report.csv` — every distinct template with its `emp_code`(s), `template_hash`, `occurrences` |
+| `GetBiotmpforEmpCode.py` | `emp_code` | `biooutput` — that employee's raw template bytes, one per line |
+| `GetempndbioasperTime.py` | `start_time` `end_time` | `emp_codes_templates_by_punch_time.csv` — `emp_code,actual_template` for punches in the window |
+
+`start_time` / `end_time` use `'YYYY-MM-DD HH:MM:SS'`. Override any output with
+`-o FILE` (`--output`).
+
+```sh
+# Dump the whole database as the CSV consumed by `matchall.py --csv`:
+python3 GetallTemplates.py --host db.example.com --user reader --database attendance
+
+# Pull one employee's templates (raw bytes, one per line):
+python3 GetBiotmpforEmpCode.py 142281 -o emp142281.txt \
+    --host db.example.com --user reader --database attendance
+
+# Templates for everyone who punched in a time window:
+python3 GetempndbioasperTime.py '2026-01-01 00:00:00' '2026-01-31 23:59:59' \
+    --host db.example.com --user reader --database attendance
+```
+
+A typical workflow is `GetallTemplates.py` (or `GetempndbioasperTime.py`) to
+produce a CSV, then `matchall.py --csv` / `--query-csv` to compare it.
+
+> **Note:** `GetallTemplates.py` ends its query with `LIMIT 3` (a testing
+> leftover) and therefore exports only the first three rows — remove the
+> `LIMIT 3` to export the full table.
 
 ---
 
